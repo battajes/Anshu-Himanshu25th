@@ -1,0 +1,7 @@
+cat > .gitignore << 'EOF'
+.env
+rsvps.sqlite
+*.sqlite
+*.sqlite-journal
+node_modules
+EOF
