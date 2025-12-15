@@ -1,136 +1,139 @@
+import "dotenv/config";
 import express from "express";
 import path from "path";
 import { fileURLToPath } from "url";
-import helmet from "helmet";
-import rateLimit from "express-rate-limit";
-import sqlite3 from "sqlite3";
-import "dotenv/config";
+import { MongoClient } from "mongodb";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const PORT = process.env.PORT || 3000;
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || "";
+const MONGODB_URI = process.env.MONGODB_URI || "";
+const DB_NAME = process.env.MONGODB_DB || "anniversary";
+
+if (!ADMIN_PASSWORD) {
+  console.warn("⚠️  ADMIN_PASSWORD is not set. /admin will not work.");
+}
+if (!MONGODB_URI) {
+  console.warn("⚠️  MONGODB_URI is not set. RSVPs cannot be saved.");
+}
 
 const app = express();
-app.use(helmet({
-  contentSecurityPolicy: false, // keep simple; you can tighten later
-}));
-app.use(express.json({ limit: "200kb" }));
+app.use(express.json());
 
-// Rate limit the RSVP endpoint (basic protection)
-const rsvpLimiter = rateLimit({
-  windowMs: 10 * 60 * 1000,
-  max: 40,
-});
-app.use("/api/rsvp", rsvpLimiter);
+// Serve static site files
+const publicDir = path.join(__dirname, "public");
+app.use(express.static(publicDir));
 
-const dbPath = process.env.DB_PATH || path.join(__dirname, "rsvps.sqlite");
-sqlite3.verbose();
-const db = new sqlite3.Database(dbPath);
-
-db.serialize(() => {
-  db.run(`
-    CREATE TABLE IF NOT EXISTS rsvps (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      name TEXT NOT NULL,
-      email TEXT,
-      phone TEXT,
-      attending TEXT NOT NULL,
-      guestCount INTEGER NOT NULL,
-      meal TEXT,
-      allergies TEXT,
-      message TEXT,
-      createdAt TEXT NOT NULL,
-      ip TEXT
-    );
-  `);
+// Make /admin work as a clean route
+app.get("/admin", (req, res) => {
+  res.sendFile(path.join(publicDir, "admin.html"));
 });
 
-function basicAuth(req, res, next) {
+// --- Mongo connection (single shared client) ---
+let client;
+let rsvpsCollection;
+
+async function connectMongo() {
+  if (rsvpsCollection) return rsvpsCollection;
+
+  client = new MongoClient(MONGODB_URI);
+  await client.connect();
+  const db = client.db(DB_NAME);
+  rsvpsCollection = db.collection("rsvps");
+
+  // Optional index to sort by createdAt
+  await rsvpsCollection.createIndex({ createdAt: -1 });
+
+  console.log("✅ Connected to MongoDB Atlas");
+  return rsvpsCollection;
+}
+
+// --- Basic Auth middleware for admin ---
+function requireAdmin(req, res, next) {
   if (!ADMIN_PASSWORD) {
     return res.status(500).json({ error: "ADMIN_PASSWORD not set on server." });
   }
-  const header = req.headers.authorization || "";
-  const [type, token] = header.split(" ");
-  if (type !== "Basic" || !token) {
-    res.setHeader("WWW-Authenticate", "Basic realm=\"Admin\"");
-    return res.status(401).send("Auth required");
+
+  const auth = req.headers.authorization || "";
+  const [scheme, token] = auth.split(" ");
+  if (scheme !== "Basic" || !token) {
+    res.setHeader("WWW-Authenticate", 'Basic realm="Admin"');
+    return res.status(401).json({ error: "Missing auth." });
   }
-  const decoded = Buffer.from(token, "base64").toString("utf8");
-  const [user, pass] = decoded.split(":");
-  if (user !== "admin" || pass !== ADMIN_PASSWORD) {
-    return res.status(403).send("Forbidden");
+
+  const decoded = Buffer.from(token, "base64").toString("utf8"); // "admin:pw"
+  const [user, pw] = decoded.split(":");
+  if (user !== "admin" || pw !== ADMIN_PASSWORD) {
+    res.setHeader("WWW-Authenticate", 'Basic realm="Admin"');
+    return res.status(401).json({ error: "Unauthorized." });
   }
+
   next();
 }
 
-app.get("/api/health", (req, res) => res.json({ ok: true }));
-
-app.post("/api/rsvp", (req, res) => {
-  const {
-    name = "",
-    email = "",
-    phone = "",
-    attending = "",
-    guestCount = 1,
-    meal = "",
-    allergies = "",
-    message = "",
-    createdAt = new Date().toISOString()
-  } = req.body || {};
-
-  const cleanName = String(name).trim();
-  const cleanAttending = String(attending).trim().toLowerCase();
-  const cleanGuestCount = Number(guestCount);
-
-  if (!cleanName) return res.status(400).json({ error: "Name is required." });
-  if (!Number.isFinite(cleanGuestCount) || cleanGuestCount < 1 || cleanGuestCount > 50) {
-    return res.status(400).json({ error: "Guest count must be between 1 and 50." });
+// --- Health check ---
+app.get("/api/health", async (req, res) => {
+  try {
+    await connectMongo();
+    // ping
+    await client.db(DB_NAME).command({ ping: 1 });
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e?.message || "db error" });
   }
+});
 
-  const stmt = db.prepare(`
-    INSERT INTO rsvps (name, email, phone, attending, guestCount, meal, allergies, message, createdAt, ip)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-  `);
+// --- RSVP submit ---
+app.post("/api/rsvp", async (req, res) => {
+  try {
+    const col = await connectMongo();
 
-  stmt.run(
-    cleanName,
-    String(email).trim(),
-    String(phone).trim(),
-    cleanAttending,
-    cleanGuestCount,
-    String(meal).trim(),
-    String(allergies).trim(),
-    String(message).trim(),
-    String(createdAt),
-    req.ip,
-    function (err) {
-      if (err) return res.status(500).json({ error: "Could not save RSVP." });
-      return res.json({ ok: true, id: this.lastID });
+    const { name, email, phone, guestCount, message } = req.body || {};
+
+    if (!name || !String(name).trim()) {
+      return res.status(400).json({ error: "Name is required." });
     }
-  );
-  stmt.finalize();
-});
-
-app.get("/api/admin/rsvps", basicAuth, (req, res) => {
-  db.all(
-    "SELECT id, name, email, phone, attending, guestCount, meal, allergies, message, createdAt FROM rsvps ORDER BY id DESC",
-    (err, rows) => {
-      if (err) return res.status(500).json({ error: "Could not fetch RSVPs." });
-      res.json({ ok: true, rsvps: rows });
+    const gc = Number(guestCount || 1);
+    if (!gc || gc < 1) {
+      return res.status(400).json({ error: "Guest count must be at least 1." });
     }
-  );
+
+    const doc = {
+      name: String(name).trim(),
+      email: email ? String(email).trim() : "",
+      phone: phone ? String(phone).trim() : "",
+      guestCount: gc,
+      message: message ? String(message).trim() : "",
+      createdAt: new Date().toISOString(),
+    };
+
+    const result = await col.insertOne(doc);
+    return res.status(201).json({ ok: true, id: result.insertedId.toString() });
+  } catch (e) {
+    return res.status(500).json({ error: e?.message || "Server error." });
+  }
 });
 
-// Serve the admin page (still requires login when it fetches data)
-app.get("/admin", (req, res) => {
-  res.sendFile(path.join(__dirname, "public", "admin.html"));
-});
+// --- Admin: list RSVPs ---
+app.get("/api/admin/rsvps", requireAdmin, async (req, res) => {
+  try {
+    const col = await connectMongo();
+    const docs = await col.find({}).sort({ createdAt: -1 }).limit(5000).toArray();
 
-app.use(express.static(path.join(__dirname, "public")));
+    // Return with `id` (string) instead of `_id`
+    const rsvps = docs.map(({ _id, ...rest }) => ({
+      id: _id.toString(),
+      ...rest,
+    }));
+
+    res.json({ ok: true, rsvps });
+  } catch (e) {
+    res.status(500).json({ error: e?.message || "Server error." });
+  }
+});
 
 app.listen(PORT, () => {
-  console.log(`RSVP site running on http://localhost:${PORT}`);
-  console.log(`Database: ${dbPath}`);
+  console.log(`✅ Server running on http://localhost:${PORT}`);
 });
